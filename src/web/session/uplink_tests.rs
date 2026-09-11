@@ -1,0 +1,126 @@
+use super::*;
+use std::net::SocketAddr;
+
+use crate::config::{
+    WebCarrier, WebLimitsConfig, WebRuntimeProfile, WebSecretMode, WebTimeoutsConfig,
+};
+use crate::web::manager::WebProcessRuntime;
+
+fn session() -> Arc<WebSession> {
+    session_with_automatic(false)
+}
+
+fn session_with_automatic(automatic: bool) -> Arc<WebSession> {
+    let profile = Arc::new(WebRuntimeProfile {
+        host: "proxy.example.com".to_string(),
+        public_addr: SocketAddr::from(([203, 0, 113, 10], 443)),
+        user: "alice".to_string(),
+        secret_mode: WebSecretMode::Plain,
+        carrier: WebCarrier::Https,
+        carrier_negotiation_enabled: false,
+        carrier_learning: true,
+        carriers: Arc::from([WebCarrier::Https]),
+        carrier_negotiation_deadlines_secs: [3, 5, 8, 12],
+        capability: [0; 32],
+        key_fingerprint: "0000000000000000".to_string(),
+        max_sessions: 1,
+        max_streams: 1,
+        max_streams_per_session: 1,
+    });
+    WebSession::new(
+        std::sync::Weak::<WebProcessRuntime>::new(),
+        [1; 32],
+        "192.0.2.10".parse().unwrap(),
+        1,
+        profile,
+        [2; 32],
+        WebCarrier::Https,
+        1,
+        [3; 32],
+        None,
+        if automatic {
+            crate::web::manager::CarrierClientClass::Bridge
+        } else {
+            crate::web::manager::CarrierClientClass::Legacy
+        },
+        None,
+        automatic,
+        false,
+        WebLimitsConfig::default(),
+        WebTimeoutsConfig::default(),
+    )
+}
+
+#[test]
+fn uplink_retry_commits_only_one_exact_body() {
+    let session = session();
+    let first = frame::encode(FrameType::Pong, 0, &[1, 2, 3]);
+    assert_eq!(session.process_up(1, &first), Ok(1));
+    assert_eq!(session.process_up(1, &first), Ok(1));
+
+    let changed = frame::encode(FrameType::Pong, 0, &[1, 2, 4]);
+    assert_eq!(session.process_up(1, &changed), Err(ManagerError::Protocol));
+    assert!(session.state.lock().closed);
+}
+
+#[test]
+fn concurrent_uplink_does_not_commit_sequence() {
+    let session = session();
+    let body = frame::encode(FrameType::Pong, 0, &[]);
+    session.up_active.store(true, Ordering::Release);
+    assert_eq!(session.process_up(1, &body), Err(ManagerError::Concurrent));
+    assert_eq!(session.state.lock().last_up_sequence, 0);
+    session.up_active.store(false, Ordering::Release);
+    assert_eq!(session.process_up(1, &body), Ok(1));
+}
+
+#[test]
+fn backpressured_uplink_does_not_commit_or_close() {
+    let session = session();
+    {
+        let mut state = session.state.lock();
+        state.streams.insert(
+            1,
+            StreamState {
+                instance: 1,
+                inbound: VecDeque::new(),
+                receive_window: frame::INITIAL_STREAM_WINDOW,
+                send_credit: u64::from(frame::INITIAL_STREAM_WINDOW),
+                read_waker: None,
+                write_waker: None,
+            },
+        );
+        state.pending_bytes = session.limits.pending_bytes_per_session;
+    }
+    let body = frame::encode(FrameType::Data, 1, &[1]);
+
+    assert_eq!(
+        session.process_up(1, &body),
+        Err(ManagerError::Backpressure)
+    );
+    let state = session.state.lock();
+    assert!(!state.closed);
+    assert_eq!(state.last_up_sequence, 0);
+    assert!(state.streams.get(&1).unwrap().inbound.is_empty());
+}
+
+#[test]
+fn uplink_gap_is_fatal() {
+    let session = session();
+    let body = frame::encode(FrameType::Pong, 0, &[]);
+    assert_eq!(session.process_up(2, &body), Err(ManagerError::Protocol));
+    assert!(session.state.lock().closed);
+}
+
+#[test]
+fn automatic_uplink_does_not_ack_a_batch_without_real_progress() {
+    let session = session_with_automatic(true);
+    let body = frame::encode(FrameType::Pong, 0, &[]);
+
+    assert_eq!(
+        session.process_up(1, &body),
+        Err(ManagerError::Backpressure)
+    );
+    assert!(!session.is_carrier_committed());
+    assert!(!session.state.lock().closed);
+}
